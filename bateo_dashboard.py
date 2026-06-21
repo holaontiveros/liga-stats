@@ -2,6 +2,9 @@ import requests
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import re
+import unicodedata
+from rapidfuzz import fuzz
 
 
 TEMPORADA_ACTUAL_API_URL = "https://apiliga.serteza.com/public/api/temporadaActual"
@@ -20,6 +23,131 @@ st.set_page_config(
 # ---------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------
+def normalize_text(value: str) -> str:
+    value = str(value).lower().strip()
+
+    value = unicodedata.normalize("NFD", value)
+    value = "".join(char for char in value if unicodedata.category(char) != "Mn")
+
+    # Keep letters and numbers, turn punctuation into spaces
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+
+    return " ".join(value.split())
+
+
+def tokenize(value: str) -> list[str]:
+    return normalize_text(value).split()
+
+
+def team_search_score(query: str, search_text: str) -> dict:
+    """
+    Search made specifically for team names.
+
+    Priority:
+    1. Exact word match
+    2. Word starts with the query
+    3. Query is contained inside a word
+    4. General fuzzy similarity
+    """
+    query_norm = normalize_text(query)
+    text_norm = normalize_text(search_text)
+
+    query_tokens = tokenize(query)
+    text_tokens = tokenize(search_text)
+
+    if not query_tokens:
+        return {
+            "FinalScore": 100,
+            "ExactTokenScore": 0,
+            "PrefixScore": 0,
+            "ContainsScore": 0,
+            "FuzzyScore": 100,
+        }
+
+    exact_token_score = 0
+    prefix_score = 0
+    contains_score = 0
+
+    for query_token in query_tokens:
+        if query_token in text_tokens:
+            exact_token_score += 1
+
+        if any(text_token.startswith(query_token) for text_token in text_tokens):
+            prefix_score += 1
+
+        if any(query_token in text_token for text_token in text_tokens):
+            contains_score += 1
+
+    fuzzy_score = fuzz.token_set_ratio(query_norm, text_norm)
+
+    # The big weights make exact/prefix matches dominate fuzzy similarity.
+    final_score = (
+        exact_token_score * 1000
+        + prefix_score * 500
+        + contains_score * 250
+        + fuzzy_score
+    )
+
+    return {
+        "FinalScore": final_score,
+        "ExactTokenScore": exact_token_score,
+        "PrefixScore": prefix_score,
+        "ContainsScore": contains_score,
+        "FuzzyScore": fuzzy_score,
+    }
+
+
+def fuzzy_filter_teams(
+    df: pd.DataFrame,
+    query: str,
+    limit: int = 80,
+    score_cutoff: int = 35,
+) -> pd.DataFrame:
+    query = query.strip()
+
+    if not query:
+        return df.copy()
+
+    scored_rows = []
+
+    for index, row in df.iterrows():
+        scores = team_search_score(query, row["SearchText"])
+
+        # Use fuzzy score only as the cutoff, but not as the only ranking.
+        if scores["FuzzyScore"] >= score_cutoff or scores["ContainsScore"] > 0:
+            scored_rows.append(
+                {
+                    "index": index,
+                    **scores,
+                }
+            )
+
+    if not scored_rows:
+        return df.iloc[0:0].copy()
+
+    scores_df = pd.DataFrame(scored_rows)
+
+    result = df.loc[scores_df["index"]].copy()
+
+    result["FinalScore"] = scores_df["FinalScore"].values
+    result["ExactTokenScore"] = scores_df["ExactTokenScore"].values
+    result["PrefixScore"] = scores_df["PrefixScore"].values
+    result["ContainsScore"] = scores_df["ContainsScore"].values
+    result["FuzzyScore"] = scores_df["FuzzyScore"].values
+
+    result = result.sort_values(
+        [
+            "ExactTokenScore",
+            "PrefixScore",
+            "ContainsScore",
+            "FuzzyScore",
+            "Equipo",
+        ],
+        ascending=[False, False, False, False, True],
+    )
+
+    return result.head(limit)
+
 def short_name(full_name: str) -> str:
     parts = str(full_name).title().split()
 
@@ -176,6 +304,20 @@ def fetch_teams(temporada_id: str) -> pd.DataFrame:
         axis=1,
     )
 
+    df["SearchText"] = df.apply(
+    lambda r: " ".join(
+        [
+            str(r["Equipo"]),
+            str(r["EquipoBase"]),
+            str(r["Categoria"]),
+            str(r["Clasificacion"]),
+            str(r["Grupo"]),
+            str(r["InscripcionID"]),
+        ]
+    ),
+    axis=1,
+)
+
     return df
 
 
@@ -330,16 +472,33 @@ search_text = st.sidebar.text_input(
     help="Puedes buscar por nombre, categoría, grupo o parte del texto del equipo.",
 )
 
-visible_teams = teams_df.copy()
+with st.sidebar.expander("Opciones de búsqueda"):
+    fuzzy_score = st.slider(
+        "Qué tan estricta debe ser la búsqueda",
+        min_value=20,
+        max_value=90,
+        value=45,
+        step=5,
+        help=(
+            "Más bajo encuentra más resultados, aunque sean menos exactos. "
+            "Más alto exige coincidencias más cercanas."
+        ),
+    )
 
-if search_text.strip():
-    query = search_text.strip().lower()
+visible_teams = fuzzy_filter_teams(
+    teams_df,
+    search_text,
+    limit=80,
+    score_cutoff=fuzzy_score,
+)
 
-    visible_teams = visible_teams[
-        visible_teams["Equipo"].str.lower().str.contains(query, na=False)
-        | visible_teams["Categoria"].str.lower().str.contains(query, na=False)
-        | visible_teams["EquipoBase"].str.lower().str.contains(query, na=False)
-    ]
+if "FuzzyScore" in visible_teams.columns:
+    visible_teams["SelectorVisible"] = visible_teams.apply(
+        lambda r: f'{r["Equipo"]} — match {r["FuzzyScore"]:.0f}% — ID {r["InscripcionID"]}',
+        axis=1,
+    )
+else:
+    visible_teams["SelectorVisible"] = visible_teams["Selector"]
 
 if visible_teams.empty:
     st.sidebar.warning("No hay equipos que coincidan con la búsqueda.")
@@ -358,11 +517,11 @@ if not venados_match.empty:
 
 selected_label = st.sidebar.selectbox(
     "Equipo",
-    options=visible_teams["Selector"].tolist(),
-    index=default_index,
+    options=visible_teams["SelectorVisible"].tolist(),
+    index=0,
 )
 
-selected_team = visible_teams[visible_teams["Selector"] == selected_label].iloc[0]
+selected_team = visible_teams[visible_teams["SelectorVisible"] == selected_label].iloc[0]
 
 inscripcion_id = str(selected_team["InscripcionID"])
 

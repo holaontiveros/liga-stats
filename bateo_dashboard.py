@@ -4,10 +4,10 @@ import plotly.express as px
 import streamlit as st
 
 
+TEMPORADA_ACTUAL_API_URL = "https://apiliga.serteza.com/public/api/temporadaActual"
+EQUIPOS_API_URL = "https://apiliga.serteza.com/public/api/roljuegos/obtenerEquipos"
 BATEO_API_URL = "https://apiliga.serteza.com/public/api/compilacion/obtenerBateo"
 PITCHEO_API_URL = "https://apiliga.serteza.com/public/api/compilacion/obtenerPitcheo"
-
-DEFAULT_INSCRIPCION_ID = "13490"
 
 
 st.set_page_config(
@@ -59,10 +59,9 @@ def safe_div(numerator: float, denominator: float) -> float:
     return numerator / denominator
 
 
-def api_headers() -> dict:
-    return {
+def api_headers(include_content_type: bool = True) -> dict:
+    headers = {
         "accept": "application/json, text/plain, */*",
-        "content-type": "application/json",
         "origin": "https://ligayucatan.org",
         "referer": "https://ligayucatan.org/",
         "user-agent": (
@@ -70,6 +69,114 @@ def api_headers() -> dict:
             "AppleWebKit/537.36 Chrome Safari/537.36"
         ),
     }
+
+    if include_content_type:
+        headers["content-type"] = "application/json"
+
+    return headers
+
+
+def parse_team_parts(team_name: str) -> dict:
+    """
+    Intenta separar el nombre largo del equipo en:
+    - nombre base
+    - categoría
+    - clasificación
+    - grupo
+
+    Ejemplo:
+    VENADOS KINDER 7-8 A II
+    """
+    categories = [
+        "TEE-BALL 3-4",
+        "INICIACION 5-6",
+        "KINDER 7-8",
+        "DIVISION INFANTIL MENOR 09-10",
+        "DIVISION INFANTIL MAYOR 11-12",
+        "DIVISION JUVENIL MENOR 13-14",
+        "DIVISION JUVENIL MAYOR 15-16-17",
+    ]
+
+    result = {
+        "EquipoBase": team_name,
+        "Categoria": "Sin categoría",
+        "Clasificacion": "",
+        "Grupo": "",
+    }
+
+    for category in categories:
+        if category in team_name:
+            before, after = team_name.split(category, 1)
+
+            tokens = after.strip().split()
+
+            result["EquipoBase"] = before.strip()
+            result["Categoria"] = category
+
+            if len(tokens) >= 1:
+                result["Clasificacion"] = tokens[0]
+
+            if len(tokens) >= 2:
+                result["Grupo"] = tokens[1]
+
+            return result
+
+    return result
+
+
+# ---------------------------------------------------------
+# API
+# ---------------------------------------------------------
+@st.cache_data(ttl=300)
+def fetch_current_season() -> dict:
+    response = requests.get(
+        TEMPORADA_ACTUAL_API_URL,
+        headers=api_headers(include_content_type=False),
+        timeout=20,
+    )
+
+    response.raise_for_status()
+
+    payload = response.json()
+
+    if not payload.get("ok"):
+        raise ValueError("La API de temporada actual respondió con ok=false")
+
+    return payload["data"]
+
+
+@st.cache_data(ttl=300)
+def fetch_teams(temporada_id: str) -> pd.DataFrame:
+    response = requests.post(
+        EQUIPOS_API_URL,
+        headers=api_headers(),
+        json={"TemporadaID": temporada_id},
+        timeout=20,
+    )
+
+    response.raise_for_status()
+
+    payload = response.json()
+
+    if not payload.get("ok"):
+        raise ValueError("La API de equipos respondió con ok=false")
+
+    data = payload.get("data", [])
+
+    if not data:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data)
+
+    parsed = df["Equipo"].apply(parse_team_parts).apply(pd.Series)
+    df = pd.concat([df, parsed], axis=1)
+
+    df["Selector"] = df.apply(
+        lambda r: f'{r["Equipo"]} — ID {r["InscripcionID"]}',
+        axis=1,
+    )
+
+    return df
 
 
 @st.cache_data(ttl=300)
@@ -126,8 +233,6 @@ def fetch_batting_stats(inscripcion_id: str) -> pd.DataFrame:
 
     df["Nombre"] = df["Jugador"].apply(short_name)
 
-    # Bases totales estimadas:
-    # H = sencillos, H2 = dobles, H3 = triples, HR = home runs
     df["TB"] = df["H"] + (df["H2"] * 2) + (df["H3"] * 3) + (df["HR"] * 4)
 
     df["SLG"] = df.apply(lambda r: safe_div(r["TB"], r["VB"]), axis=1)
@@ -178,14 +283,9 @@ def fetch_pitching_stats(inscripcion_id: str) -> pd.DataFrame:
 
     df["Nombre"] = df["Jugador"].apply(short_name)
 
-    # La liga parece calcular PCL usando juegos de 6 entradas:
-    # PCL = CL * 6 / IP
     df["PCL_calc"] = df.apply(lambda r: safe_div(r["CL"] * 6, r["IP"]), axis=1)
 
-    # WHIP tradicional: bases por bola + hits permitidos por entrada
     df["WHIP"] = df.apply(lambda r: safe_div(r["BB"] + r["HA"], r["IP"]), axis=1)
-
-    # Métricas fáciles para coaches/papás
     df["K/IP"] = df.apply(lambda r: safe_div(r["K"], r["IP"]), axis=1)
     df["BB/IP"] = df.apply(lambda r: safe_div(r["BB"], r["IP"]), axis=1)
     df["HA/IP"] = df.apply(lambda r: safe_div(r["HA"], r["IP"]), axis=1)
@@ -198,14 +298,75 @@ def fetch_pitching_stats(inscripcion_id: str) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------
+# Load season and teams
+# ---------------------------------------------------------
+try:
+    current_season = fetch_current_season()
+    temporada_id = current_season["TemporadaID"]
+    temporada_nombre = current_season["Temporada"]
+
+    teams_df = fetch_teams(temporada_id)
+except Exception as e:
+    st.error("No se pudo cargar la temporada actual o la lista de equipos.")
+    st.exception(e)
+    st.stop()
+
+
+if teams_df.empty:
+    st.warning("No se encontraron equipos para la temporada actual.")
+    st.stop()
+
+
+# ---------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------
 st.sidebar.title("⚾ Liga de Baseball")
 
-inscripcion_id = st.sidebar.text_input(
-    "InscripcionID",
-    value=DEFAULT_INSCRIPCION_ID,
+st.sidebar.success(f"Temporada actual: {temporada_nombre}")
+
+search_text = st.sidebar.text_input(
+    "Buscar equipo",
+    value="VENADOS KINDER 7-8",
+    help="Puedes buscar por nombre, categoría, grupo o parte del texto del equipo.",
 )
+
+visible_teams = teams_df.copy()
+
+if search_text.strip():
+    query = search_text.strip().lower()
+
+    visible_teams = visible_teams[
+        visible_teams["Equipo"].str.lower().str.contains(query, na=False)
+        | visible_teams["Categoria"].str.lower().str.contains(query, na=False)
+        | visible_teams["EquipoBase"].str.lower().str.contains(query, na=False)
+    ]
+
+if visible_teams.empty:
+    st.sidebar.warning("No hay equipos que coincidan con la búsqueda.")
+    st.stop()
+
+
+default_index = 0
+
+venados_match = visible_teams[
+    visible_teams["Equipo"].str.contains("VENADOS KINDER 7-8 A II", case=False, na=False)
+]
+
+if not venados_match.empty:
+    default_index = visible_teams.index.get_loc(venados_match.index[0])
+
+
+selected_label = st.sidebar.selectbox(
+    "Equipo",
+    options=visible_teams["Selector"].tolist(),
+    index=default_index,
+)
+
+selected_team = visible_teams[visible_teams["Selector"] == selected_label].iloc[0]
+
+inscripcion_id = str(selected_team["InscripcionID"])
+
+st.sidebar.caption(f"InscripcionID seleccionado: {inscripcion_id}")
 
 min_vb = st.sidebar.slider(
     "Mínimo VB para rankings de bateo",
@@ -222,52 +383,42 @@ min_ip = st.sidebar.slider(
     step=0.5,
 )
 
-st.sidebar.caption(
-    "Subir los mínimos ayuda a que los rankings no favorezcan a jugadores con muy pocas oportunidades."
-)
-
 
 # ---------------------------------------------------------
-# Load data
+# Load stats
 # ---------------------------------------------------------
 try:
     batting_df = fetch_batting_stats(inscripcion_id)
     pitching_df = fetch_pitching_stats(inscripcion_id)
 except Exception as e:
-    st.error("No se pudieron cargar las estadísticas.")
+    st.error("No se pudieron cargar las estadísticas del equipo seleccionado.")
     st.exception(e)
     st.stop()
 
 
 if batting_df.empty and pitching_df.empty:
-    st.warning("La API no regresó datos para ese InscripcionID.")
+    st.warning("La API no regresó estadísticas para ese equipo.")
     st.stop()
 
 
 # ---------------------------------------------------------
 # Header
 # ---------------------------------------------------------
-if not batting_df.empty:
-    team_name = batting_df["Equipo"].iloc[0]
-    season = batting_df["Temporada"].iloc[0]
-    category = batting_df["Categoria"].iloc[0]
-    group = batting_df["Grupo"].iloc[0]
-    classification = batting_df["Clasificacion"].iloc[0]
-    logo_url = batting_df["Logo"].iloc[0] if "Logo" in batting_df.columns else None
-else:
-    team_name = "Equipo"
-    season = ""
-    category = ""
-    group = ""
-    classification = ""
-    logo_url = None
+team_name = selected_team["EquipoBase"]
+category = selected_team["Categoria"]
+classification = selected_team["Clasificacion"]
+group = selected_team["Grupo"]
+
+logo_url = None
+
+if not batting_df.empty and "Logo" in batting_df.columns:
+    logo_url = batting_df["Logo"].iloc[0]
 
 st.title(f"Dashboard del Equipo — {team_name}")
 
-if season:
-    st.caption(
-        f"{season} · Categoría {category} · Clasificación {classification} · Grupo {group}"
-    )
+st.caption(
+    f"{temporada_nombre} · {category} · Clasificación {classification} · Grupo {group} · Inscripción {inscripcion_id}"
+)
 
 if logo_url:
     st.image(logo_url, width=110)
@@ -276,11 +427,12 @@ if logo_url:
 # ---------------------------------------------------------
 # Main tabs
 # ---------------------------------------------------------
-main_tab1, main_tab2, main_tab3 = st.tabs(
+main_tab1, main_tab2, main_tab3, main_tab4 = st.tabs(
     [
         "⚾ Bateo",
         "🧢 Pitcheo",
         "📋 Resumen del equipo",
+        "🏟️ Equipos",
     ]
 )
 
@@ -298,11 +450,8 @@ with main_tab1:
 
         team_vb = batting_df["VB"].sum()
         team_hits = batting_df["TH"].sum()
-        team_walks = batting_df["B"].sum()
         team_runs = batting_df["C"].sum()
         team_rbi = batting_df["CE"].sum()
-        team_strikeouts = batting_df["K"].sum()
-        team_plate_appearances = batting_df["V"].sum()
 
         team_avg = safe_div(team_hits, team_vb)
 
@@ -426,10 +575,6 @@ with main_tab1:
 
             st.plotly_chart(fig, use_container_width=True)
 
-            st.caption(
-                "Más a la derecha significa más turnos. Más arriba significa mejor promedio."
-            )
-
         with bateo_tab2:
             hit_cols = ["H", "H2", "H3", "HR"]
 
@@ -489,13 +634,6 @@ with main_tab1:
             fig.update_layout(yaxis={"categoryorder": "total ascending"})
             st.plotly_chart(fig, use_container_width=True)
 
-            if metric_choice == "K%":
-                st.caption("En K%, más bajo normalmente es mejor.")
-            elif metric_choice == "BB%":
-                st.caption("En BB%, más alto significa que recibe más bases por bola.")
-            else:
-                st.caption("Contact% estima qué tanto evita poncharse el jugador.")
-
         with bateo_tab4:
             display_cols = [
                 "Nombre",
@@ -548,7 +686,6 @@ with main_tab2:
         team_bb = pitching_df["BB"].sum()
         team_k = pitching_df["K"].sum()
         team_ha = pitching_df["HA"].sum()
-        team_db = pitching_df["DB"].sum()
         team_wins = pitching_df["Ganados"].sum()
         team_losses = pitching_df["Perdidos"].sum()
 
@@ -569,7 +706,7 @@ with main_tab2:
             st.markdown(
                 """
                 - **IP**: Entradas lanzadas.
-                - **PCL**: Promedio de carreras limpias. En esta liga parece calcularse a base de **6 entradas**: `CL * 6 / IP`.
+                - **PCL**: Promedio de carreras limpias. En esta liga parece calcularse a base de 6 entradas: `CL * 6 / IP`.
                 - **WHIP**: Hits permitidos + bases por bola por entrada. Más bajo es mejor.
                 - **K/IP**: Ponches por entrada. Más alto indica más dominio.
                 - **BB/IP**: Bases por bola por entrada. Más bajo indica mejor control.
@@ -694,10 +831,6 @@ with main_tab2:
             fig.update_layout(xaxis_tickangle=-35)
             st.plotly_chart(fig, use_container_width=True)
 
-            st.caption(
-                "Esta gráfica muestra quién ha cargado más entradas durante la temporada."
-            )
-
         with pitcheo_tab3:
             metric_choice = st.radio(
                 "Métrica de pitcheo",
@@ -732,11 +865,6 @@ with main_tab2:
                 fig.update_layout(yaxis={"categoryorder": "total ascending"})
 
             st.plotly_chart(fig, use_container_width=True)
-
-            if metric_choice in ["PCL", "WHIP", "BB/IP", "BasesGratis/IP"]:
-                st.caption("En esta métrica, más bajo normalmente es mejor.")
-            else:
-                st.caption("En esta métrica, más alto normalmente es mejor.")
 
         with pitcheo_tab4:
             display_cols = [
@@ -878,9 +1006,38 @@ with main_tab3:
         )
 
 
+# ---------------------------------------------------------
+# Equipos
+# ---------------------------------------------------------
+with main_tab4:
+    st.header("🏟️ Equipos de la temporada")
+
+    st.caption(
+        "Esta tabla viene de la API de equipos y permite encontrar rápidamente el InscripcionID correcto."
+    )
+
+    display_teams = teams_df[
+        [
+            "InscripcionID",
+            "Inscripcion",
+            "Equipo",
+            "EquipoBase",
+            "Categoria",
+            "Clasificacion",
+            "Grupo",
+        ]
+    ].copy()
+
+    st.dataframe(
+        display_teams,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
 st.divider()
 
 st.caption(
     "Dashboard generado desde la API pública de compilación. "
-    "Las métricas adicionales son calculadas localmente para hacer las estadísticas más fáciles de entender."
+    "La temporada y los equipos se cargan automáticamente para evitar escribir manualmente el InscripcionID."
 )

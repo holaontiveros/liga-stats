@@ -5,6 +5,8 @@ import streamlit as st
 import re
 import unicodedata
 from rapidfuzz import fuzz
+from io import BytesIO
+import zipfile
 
 
 TEMPORADA_ACTUAL_API_URL = "https://apiliga.serteza.com/public/api/temporadaActual"
@@ -23,6 +25,62 @@ st.set_page_config(
 # ---------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------
+def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8-sig")
+
+
+def safe_filename(value: str) -> str:
+    value = normalize_text(value)
+    value = value.replace(" ", "_")
+    return value[:120]
+
+
+def build_current_team_zip(
+    selected_team: pd.Series,
+    batting_df: pd.DataFrame,
+    pitching_df: pd.DataFrame,
+) -> bytes:
+    zip_buffer = BytesIO()
+
+    equipo_name = str(selected_team["Equipo"])
+    inscripcion_id = str(selected_team["InscripcionID"])
+
+    metadata_df = pd.DataFrame(
+        [
+            {
+                "InscripcionID": inscripcion_id,
+                "Inscripcion": selected_team.get("Inscripcion", ""),
+                "Equipo": equipo_name,
+                "EquipoBase": selected_team.get("EquipoBase", ""),
+                "Categoria": selected_team.get("Categoria", ""),
+                "Clasificacion": selected_team.get("Clasificacion", ""),
+                "Grupo": selected_team.get("Grupo", ""),
+            }
+        ]
+    )
+
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        zip_file.writestr(
+            "equipo.csv",
+            dataframe_to_csv_bytes(metadata_df),
+        )
+
+        if not batting_df.empty:
+            zip_file.writestr(
+                "bateo.csv",
+                dataframe_to_csv_bytes(batting_df),
+            )
+
+        if not pitching_df.empty:
+            zip_file.writestr(
+                "pitcheo.csv",
+                dataframe_to_csv_bytes(pitching_df),
+            )
+
+    zip_buffer.seek(0)
+
+    return zip_buffer.getvalue()
+
 def normalize_text(value: str) -> str:
     value = str(value).lower().strip()
 
@@ -185,6 +243,74 @@ def safe_div(numerator: float, denominator: float) -> float:
         return 0
 
     return numerator / denominator
+
+
+BATTING_METRIC_GLOSSARY: dict[str, str] = {
+    "PCT": "Promedio de bateo (hits / veces al bat).",
+    "AVG": "Promedio de bateo (hits / veces al bat).",
+    "OBP": "On-base percentage: qué tanto se embasa el jugador.",
+    "SLG": "Slugging: poder de bateo, da más peso a dobles, triples y home runs.",
+    "OPS": "OBP + SLG. Métrica general ofensiva.",
+    "K%": "Porcentaje de ponches (más bajo suele ser mejor).",
+    "BB%": "Porcentaje de bases por bola.",
+    "Contact%": "Porcentaje estimado de turnos sin ponche (más alto es mejor).",
+    "VB": "Veces al bat.",
+    "V": "Apariciones al plato.",
+    "VJ": "Juegos en los que participó.",
+    "TH": "Total de hits.",
+    "H": "Sencillos.",
+    "H2": "Dobles.",
+    "H3": "Triples.",
+    "HR": "Home runs.",
+    "B": "Bases por bola recibidas.",
+    "K": "Ponches.",
+    "C": "Carreras anotadas.",
+    "CE": "Carreras empujadas.",
+    "DB": "Golpeados por lanzamiento (dead ball).",
+}
+
+
+PITCHING_METRIC_GLOSSARY: dict[str, str] = {
+    "IP": "Entradas lanzadas.",
+    "PCL": "Promedio de carreras limpias (CL * 6 / IP en esta liga). Más bajo es mejor.",
+    "WHIP": "Hits permitidos + bases por bola por entrada. Más bajo es mejor.",
+    "K": "Ponches realizados.",
+    "BB": "Bases por bola otorgadas.",
+    "DB": "Golpeados por lanzamiento (dead ball).",
+    "HA": "Hits permitidos.",
+    "CL": "Carreras limpias permitidas.",
+    "TC": "Total de carreras permitidas.",
+    "K/IP": "Ponches por entrada. Más alto indica más dominio.",
+    "BB/IP": "Bases por bola por entrada. Más bajo indica mejor control.",
+    "HA/IP": "Hits permitidos por entrada.",
+    "K/BB": "Relación ponches contra bases por bola. Más alto es mejor.",
+    "BasesGratis/IP": "Bases por bola + golpeados por entrada. Más bajo es mejor.",
+    "Jugo": "Juegos en los que lanzó.",
+    "Ganados": "Juegos ganados.",
+    "Perdidos": "Juegos perdidos.",
+}
+
+
+def render_metric_legend(
+    metrics: list[str],
+    glossary: dict[str, str],
+    title: str = "¿Qué significan estas métricas?",
+) -> None:
+    seen: set[str] = set()
+    items: list[str] = []
+
+    for metric in metrics:
+        if metric in seen or metric not in glossary:
+            continue
+
+        seen.add(metric)
+        items.append(f"- **{metric}**: {glossary[metric]}")
+
+    if not items:
+        return
+
+    st.markdown(f"**{title}**")
+    st.markdown("\n".join(items))
 
 
 def api_headers(include_content_type: bool = True) -> dict:
@@ -444,6 +570,10 @@ def fetch_pitching_stats(inscripcion_id: str) -> pd.DataFrame:
 # ---------------------------------------------------------
 try:
     current_season = fetch_current_season()
+    # current_season = {
+    #     "TemporadaID": "34",
+    #     "Temporada": "Temporada 106 (maybe)",
+    # }
     temporada_id = current_season["TemporadaID"]
     temporada_nombre = current_season["Temporada"]
 
@@ -494,7 +624,7 @@ visible_teams = fuzzy_filter_teams(
 
 if "FuzzyScore" in visible_teams.columns:
     visible_teams["SelectorVisible"] = visible_teams.apply(
-        lambda r: f'{r["Equipo"]} — match {r["FuzzyScore"]:.0f}% — ID {r["InscripcionID"]}',
+        lambda r: f'{r["Equipo"]} — ID {r["InscripcionID"]}',
         axis=1,
     )
 else:
@@ -586,12 +716,13 @@ if logo_url:
 # ---------------------------------------------------------
 # Main tabs
 # ---------------------------------------------------------
-main_tab1, main_tab2, main_tab3, main_tab4 = st.tabs(
+main_tab1, main_tab2, main_tab3, main_tab5 = st.tabs(
     [
         "⚾ Bateo",
         "🧢 Pitcheo",
         "📋 Resumen del equipo",
-        "🏟️ Equipos",
+        # "🏟️ Equipos",
+        "⬇️ Dump CSV",
     ]
 )
 
@@ -734,6 +865,11 @@ with main_tab1:
 
             st.plotly_chart(fig, use_container_width=True)
 
+            render_metric_legend(
+                ["VB", "PCT", "TH", "OBP", "SLG", "OPS"],
+                BATTING_METRIC_GLOSSARY,
+            )
+
         with bateo_tab2:
             hit_cols = ["H", "H2", "H3", "HR"]
 
@@ -768,6 +904,11 @@ with main_tab1:
             fig.update_layout(xaxis_tickangle=-35)
             st.plotly_chart(fig, use_container_width=True)
 
+            render_metric_legend(
+                ["H", "H2", "H3", "HR"],
+                BATTING_METRIC_GLOSSARY,
+            )
+
         with bateo_tab3:
             metric_choice = st.radio(
                 "Métrica de bateo",
@@ -792,6 +933,11 @@ with main_tab1:
 
             fig.update_layout(yaxis={"categoryorder": "total ascending"})
             st.plotly_chart(fig, use_container_width=True)
+
+            render_metric_legend(
+                ["BB%", "K%", "Contact%"],
+                BATTING_METRIC_GLOSSARY,
+            )
 
         with bateo_tab4:
             display_cols = [
@@ -827,6 +973,12 @@ with main_tab1:
                 table[col] = table[col].map(pct)
 
             st.dataframe(table, use_container_width=True, hide_index=True)
+
+            render_metric_legend(
+                display_cols,
+                BATTING_METRIC_GLOSSARY,
+                title="Glosario de columnas",
+            )
 
 
 # ---------------------------------------------------------
@@ -973,6 +1125,11 @@ with main_tab2:
                 "Idealmente, un pitcher aparece más arriba y más a la izquierda: más ponches y menos bases por bola."
             )
 
+            render_metric_legend(
+                ["BB/IP", "K/IP", "IP", "K", "BB", "DB", "PCL", "WHIP", "K/BB"],
+                PITCHING_METRIC_GLOSSARY,
+            )
+
         with pitcheo_tab2:
             workload = pitching_df.sort_values("IP", ascending=False)
 
@@ -989,6 +1146,8 @@ with main_tab2:
 
             fig.update_layout(xaxis_tickangle=-35)
             st.plotly_chart(fig, use_container_width=True)
+
+            render_metric_legend(["IP"], PITCHING_METRIC_GLOSSARY)
 
         with pitcheo_tab3:
             metric_choice = st.radio(
@@ -1024,6 +1183,11 @@ with main_tab2:
                 fig.update_layout(yaxis={"categoryorder": "total ascending"})
 
             st.plotly_chart(fig, use_container_width=True)
+
+            render_metric_legend(
+                ["PCL", "WHIP", "K/IP", "BB/IP", "K/BB", "BasesGratis/IP"],
+                PITCHING_METRIC_GLOSSARY,
+            )
 
         with pitcheo_tab4:
             display_cols = [
@@ -1062,6 +1226,12 @@ with main_tab2:
                 table[col] = table[col].map(per_game)
 
             st.dataframe(table, use_container_width=True, hide_index=True)
+
+            render_metric_legend(
+                display_cols,
+                PITCHING_METRIC_GLOSSARY,
+                title="Glosario de columnas",
+            )
 
 
 # ---------------------------------------------------------
@@ -1168,30 +1338,30 @@ with main_tab3:
 # ---------------------------------------------------------
 # Equipos
 # ---------------------------------------------------------
-with main_tab4:
-    st.header("🏟️ Equipos de la temporada")
+# with main_tab4:
+#     st.header("🏟️ Equipos de la temporada")
 
-    st.caption(
-        "Esta tabla viene de la API de equipos y permite encontrar rápidamente el InscripcionID correcto."
-    )
+#     st.caption(
+#         "Esta tabla viene de la API de equipos y permite encontrar rápidamente el InscripcionID correcto."
+#     )
 
-    display_teams = teams_df[
-        [
-            "InscripcionID",
-            "Inscripcion",
-            "Equipo",
-            "EquipoBase",
-            "Categoria",
-            "Clasificacion",
-            "Grupo",
-        ]
-    ].copy()
+#     display_teams = teams_df[
+#         [
+#             "InscripcionID",
+#             "Inscripcion",
+#             "Equipo",
+#             "EquipoBase",
+#             "Categoria",
+#             "Clasificacion",
+#             "Grupo",
+#         ]
+#     ].copy()
 
-    st.dataframe(
-        display_teams,
-        use_container_width=True,
-        hide_index=True,
-    )
+#     st.dataframe(
+#         display_teams,
+#         use_container_width=True,
+#         hide_index=True,
+#     )
 
 
 st.divider()
@@ -1200,3 +1370,82 @@ st.caption(
     "Dashboard generado desde la API pública de compilación. "
     "La temporada y los equipos se cargan automáticamente para evitar escribir manualmente el InscripcionID."
 )
+
+# ---------------------------------------------------------
+# Dump CSV
+# ---------------------------------------------------------
+with main_tab5:
+    st.header("⬇️ Dump CSV del equipo seleccionado")
+
+    st.markdown(
+        f"""
+        Equipo seleccionado:
+
+        **{selected_team["Equipo"]}**
+
+        InscripcionID: `{inscripcion_id}`
+        """
+    )
+
+    export_name = safe_filename(selected_team["Equipo"])
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        metadata_df = pd.DataFrame(
+            [
+                {
+                    "InscripcionID": selected_team["InscripcionID"],
+                    "Inscripcion": selected_team.get("Inscripcion", ""),
+                    "Equipo": selected_team["Equipo"],
+                    "EquipoBase": selected_team.get("EquipoBase", ""),
+                    "Categoria": selected_team.get("Categoria", ""),
+                    "Clasificacion": selected_team.get("Clasificacion", ""),
+                    "Grupo": selected_team.get("Grupo", ""),
+                }
+            ]
+        )
+
+        st.download_button(
+            label="Descargar equipo CSV",
+            data=dataframe_to_csv_bytes(metadata_df),
+            file_name=f"{export_name}_equipo.csv",
+            mime="text/csv",
+        )
+
+    with c2:
+        if not batting_df.empty:
+            st.download_button(
+                label="Descargar bateo CSV",
+                data=dataframe_to_csv_bytes(batting_df),
+                file_name=f"{export_name}_bateo.csv",
+                mime="text/csv",
+            )
+        else:
+            st.button("Sin bateo disponible", disabled=True)
+
+    with c3:
+        if not pitching_df.empty:
+            st.download_button(
+                label="Descargar pitcheo CSV",
+                data=dataframe_to_csv_bytes(pitching_df),
+                file_name=f"{export_name}_pitcheo.csv",
+                mime="text/csv",
+            )
+        else:
+            st.button("Sin pitcheo disponible", disabled=True)
+
+    st.divider()
+
+    zip_bytes = build_current_team_zip(
+        selected_team=selected_team,
+        batting_df=batting_df,
+        pitching_df=pitching_df,
+    )
+
+    st.download_button(
+        label="Descargar ZIP completo del equipo",
+        data=zip_bytes,
+        file_name=f"{export_name}_dump.zip",
+        mime="application/zip",
+    )
